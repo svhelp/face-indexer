@@ -1,6 +1,6 @@
 import argparse
 import json
-from faces_core import extract_frames, recognize_faces, cluster_local, match_global, annotate_frames
+from core import extract_faces, cluster_local, match_global, annotate_frames
 
 # ─────────────────────────────────────────────
 # ТОЧКА ВХОДА
@@ -15,13 +15,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Шаг 0: Извлечение кадров
-    frames_dir = extract_frames(args.video_path, args.interval)
+    # Шаг 0: Извлечение кадров и распознавание лиц
+    frames_dir = extract_faces(args.video_path, args.interval)
     if not frames_dir:
         exit(1)
-
-    # Шаг 0.5: Детектирование лиц
-    recognize_faces(frames_dir)
 
     # Шаг 1: Локальная кластеризация
     local_path = cluster_local(frames_dir)

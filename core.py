@@ -1,4 +1,4 @@
-from faces_utils import _min_distance_to_cluster, _find_medoid
+from utils import _min_distance_to_cluster, _find_medoid
 import cv2
 import os
 import json
@@ -22,13 +22,12 @@ GLOBAL_MATCH_ADD    = 1.05     # < этого: совпадение, но век
 
 MAX_ENCODINGS_PER_CLUSTER = 25 # Максимум векторов на глобальный кластер (против разрастания JSON)
 
-def extract_frames(video_path, interval_seconds=5.0):
+def extract_faces(video_path, interval_seconds=5.0):
     """
-    Извлекает кадры из видео с заданным интервалом.
-
-    :param video_path: Путь к исходному видеофайлу.
-    :param interval_seconds: Интервал между кадрами в секундах.
-    :return: Путь к директории с сохраненными кадрами или None в случае ошибки.
+    Объединенный шаг: извлекает кадры из видео с заданным интервалом,
+    сразу же распознает лица с помощью InsightFace и сохраняет кадр на диск
+    только в том случае, если на нем обнаружено хотя бы одно лицо.
+    Данные о лицах сохраняются в faces_data.json.
     """
     if not os.path.exists(video_path):
         print(f"Ошибка: Видеофайл '{video_path}' не найден.")
@@ -37,13 +36,12 @@ def extract_frames(video_path, interval_seconds=5.0):
     # Получаем название видео без расширения
     video_name = Path(video_path).stem
     output_dir = os.path.join("temp", video_name)
+    output_json = os.path.join(output_dir, "faces_data.json")
 
-    # Проверяем, существует ли папка и есть ли в ней файлы кадров
-    if os.path.exists(output_dir):
-        existing_frames = [f for f in os.listdir(output_dir) if f.startswith("frame_") and f.endswith(".jpg")]
-        if existing_frames:
-            print(f"Папка '{output_dir}' уже содержит {len(existing_frames)} кадров. Пропускаем извлечение.")
-            return output_dir
+    # Проверяем, выполнено ли уже распознавание
+    if os.path.exists(output_json):
+        print(f"Файл '{output_json}' уже существует. Пропускаем этап извлечения и распознавания.")
+        return output_dir
 
     # Создаем папку для сохранения кадров, если её нет
     os.makedirs(output_dir, exist_ok=True)
@@ -64,9 +62,17 @@ def extract_frames(video_path, interval_seconds=5.0):
 
     frame_interval = max(1, int(fps * interval_seconds))
     frame_idx = 0
-    extracted_count = 0
+    saved_count = 0
 
-    print(f"Начинаем извлечение. Сохранение в '{output_dir}'...")
+    print(f"\nНачинаем совмещенный процесс извлечения и распознавания...")
+    print(f"Сохранение кадров с лицами в '{output_dir}'...")
+
+    # Инициализация InsightFace (buffalo_l — самая точная модель)
+    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    print("Инициализирована модель InsightFace (будет использован GPU, если доступен)")
+
+    results = {}
 
     while frame_idx < total_frames:
         # Быстрый переход к нужному кадру
@@ -76,65 +82,40 @@ def extract_frames(video_path, interval_seconds=5.0):
         if not ret:
             break
 
-        output_path = os.path.join(output_dir, f"frame_{extracted_count:04d}.jpg")
-        cv2.imwrite(output_path, frame)
-        extracted_count += 1
+        # Распознавание лиц прямо на кадре в памяти
+        faces = app.get(frame)
+
+        face_list = []
+        for face in faces:
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            face_list.append({
+                "location": [y1, x2, y2, x1],   # top, right, bottom, left
+                "encoding": face.normed_embedding.tolist()
+            })
+
+        # Если найдено хотя бы одно лицо, сохраняем кадр на диск и заносим в результаты
+        if face_list:
+            filename = f"frame_{saved_count:04d}.jpg"
+            output_path = os.path.join(output_dir, filename)
+            cv2.imwrite(output_path, frame)
+            
+            results[filename] = face_list
+            print(f"[{filename} (кадр {frame_idx})] Сохранено! Найдено лиц: {len(face_list)}")
+            saved_count += 1
         
         # Переходим к следующему кадру для извлечения
         frame_idx += frame_interval
 
     cap.release()
-    print(f"Извлечение завершено. Сохранено {extracted_count} кадров.")
-    return output_dir
-    
-# ─────────────────────────────────────────────
-# ШАГ 0.5: Детектирование и сохранение признаков
-# ─────────────────────────────────────────────
 
-def recognize_faces(frames_dir):
-    """
-    Применяет InsightFace ко всем кадрам, сохраняет локации и encoding'и в faces_data.json.
-    """
-    output_json = os.path.join(frames_dir, "faces_data.json")
-    if os.path.exists(output_json):
-        print(f"\nФайл '{output_json}' уже существует. Пропускаем этап детектирования лиц.")
-        return output_json
-
-    print(f"\nНачинаем поиск лиц в '{frames_dir}'...")
-
-    # Инициализация InsightFace (buffalo_l — самая точная модель)
-    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    app.prepare(ctx_id=0, det_size=(640, 640))
-    print("Инициализирована модель InsightFace (будет использован GPU, если доступен)")
-
-    results = {}
-    
-    valid_exts = {".jpg", ".jpeg", ".png"}
-
-    for filename in sorted(os.listdir(frames_dir)):
-        if Path(filename).suffix.lower() in valid_exts and os.path.isfile(os.path.join(frames_dir, filename)):
-            file_path = os.path.join(frames_dir, filename)
-            image = cv2.imread(file_path)
-            faces = app.get(image)
-
-            face_list = []
-            for face in faces:
-                x1, y1, x2, y2 = [int(v) for v in face.bbox]
-                face_list.append({
-                    "location": [y1, x2, y2, x1],   # top, right, bottom, left
-                    "encoding": face.normed_embedding.tolist()
-                })
-
-            results[filename] = face_list
-
-            if face_list:
-                print(f"[{filename}] Найдено лиц: {len(face_list)}")
-
+    # Сохраняем faces_data.json
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
-    print(f"Распознавание завершено. Данные сохранены в '{output_json}'.")
-    return output_json
+    print(f"Процесс завершен. Сохранено {saved_count} кадров с лицами.")
+    print(f"Данные о распознанных лицах сохранены в '{output_json}'.")
+    return output_dir
+
 
 # ─────────────────────────────────────────────
 # ШАГ 1: Локальная кластеризация внутри видео
@@ -145,12 +126,16 @@ def cluster_local(frames_dir):
     Шаг 1: DBSCAN-кластеризация лиц внутри одного видео.
     Оптимизация: сохраняем только лейблы и ОДИН медоид на человека (экономия места в 100 раз).
     """
+    local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
+
+    if os.path.exists(local_clusters_path):
+        print(f"Файл '{local_clusters_path}' уже существует. Пропускаем этап кластеризации.")
+        return local_clusters_path
+
     json_path = os.path.join(frames_dir, "faces_data.json")
     if not os.path.exists(json_path):
         print(f"Ошибка: '{json_path}' не найден. Запустите recognize_faces() сначала.")
         return None
-
-    local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
 
     with open(json_path, "r", encoding="utf-8") as f:
         faces_data = json.load(f)
