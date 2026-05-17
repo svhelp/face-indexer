@@ -86,10 +86,8 @@ class ReviewDialog(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
         
         # Список кластеров
-        labels = self.local_data.get("labels", [])
-        face_meta = self.local_data.get("face_meta", [])
         medoids = self.local_data.get("medoids", {})
-        global_labels = self.local_data.get("global_labels", [])
+        frames = self.local_data.get("frames", {})
         
         # Для каждого локального кластера найдем пример (медоид)
         unique_local = sorted([int(k) for k in medoids.keys()])
@@ -99,19 +97,26 @@ class ReviewDialog(tk.Toplevel):
         self.global_names.insert(0, "🆕 Создать нового человека")
 
         for local_id in unique_local:
-            # Находим первый попавшийся индекс этого лейбла для получения метаданных кадра
-            # Но лучше использовать медоид. В local_clusters.json медоид — это просто вектор.
             # Нам нужно найти кадр, где этот человек виден.
-            try:
-                idx = labels.index(local_id)
-                meta = face_meta[idx]
-            except: continue
+            found_face = None
+            found_filename = None
+            for filename, faces in frames.items():
+                for face in faces:
+                    if face.get("local_label") == local_id:
+                        found_face = face
+                        found_filename = filename
+                        break
+                if found_face:
+                    break
+            
+            if not found_face:
+                continue
             
             row = ttk.Frame(self.scrollable_frame, padding=5)
             row.pack(fill=tk.X, pady=2)
             
             # Миниатюра
-            thumb = self._get_thumbnail(meta["filename"], meta["location"])
+            thumb = self._get_thumbnail(found_filename, found_face["location"])
             if thumb:
                 img_label = tk.Label(row, image=thumb, bg="#313244")
                 img_label.image = thumb # prevent GC
@@ -123,7 +128,7 @@ class ReviewDialog(tk.Toplevel):
             ttk.Label(info_frame, text=f"Локальный ID: {local_id}", font=("Segoe UI", 9, "italic")).pack(anchor="w")
             
             # Текущее назначение
-            current_gid = global_labels[idx] if idx < len(global_labels) else -1
+            current_gid = found_face.get("global_label", -1)
             current_gc = next((g for g in self.global_clusters if g["label"] == f"person_{current_gid}"), None)
             
             assigned_text = f"Назначен: person_{current_gid}"
@@ -206,13 +211,16 @@ class ReviewDialog(tk.Toplevel):
                 json.dump(new_global_clusters, f, indent=4, ensure_ascii=False)
             
             # Обновляем локальные лейблы
-            self.local_data["global_labels"] = [local_to_global.get(l, -1) for l in self.local_data["labels"]]
+            for filename, faces in self.local_data.get("frames", {}).items():
+                for face in faces:
+                    face["global_label"] = local_to_global.get(face["local_label"], -1)
+            
             with open(self.local_clusters_path, "w", encoding="utf-8") as f:
                 json.dump(self.local_data, f, indent=4, ensure_ascii=False)
                 
             # Перерисовываем аннотации с новыми именами
             try:
-                from faces_core import annotate_frames
+                from core import annotate_frames
                 annotate_frames(self.frames_dir)
                 messagebox.showinfo("Успех", "Изменения сохранены и кадры обновлены.")
             except Exception as ae:

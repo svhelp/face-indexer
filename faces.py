@@ -1,6 +1,6 @@
-import argparse
+﻿import argparse
 import json
-from core import extract_faces, cluster_local, match_global, annotate_frames
+from core import extract_faces, cluster_local, save_previews, match_global, annotate_frames
 
 # ─────────────────────────────────────────────
 # ТОЧКА ВХОДА
@@ -24,6 +24,9 @@ if __name__ == "__main__":
     local_path = cluster_local(frames_dir)
     if not local_path:
         exit(1)
+
+    # Шаг 1.5: Сохранение превью групп
+    save_previews(frames_dir)
 
     # Проверяем, были ли уже проставлены глобальные лейблы
     with open(local_path, "r", encoding="utf-8") as f:
