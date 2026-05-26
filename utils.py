@@ -1,7 +1,15 @@
 import numpy as np
 from pathlib import Path
 
-def _find_medoid(encodings_list):
+def get_color(label):
+    if label == -1:
+        return (128, 128, 128)
+    import colorsys
+    hue = (label * 137.508) % 360 / 360.0
+    r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+    return (int(b * 255), int(g * 255), int(r * 255))
+
+def find_medoid(encodings_list):
     """
     Находит медоид — реальный вектор из списка, наиболее близкий к центру группы.
     """
@@ -26,7 +34,7 @@ def _find_medoid(encodings_list):
     return sample[best_idx].tolist()
 
 
-def _min_distance_to_cluster(query_enc, cluster_encs):
+def min_distance_to_cluster(query_enc, cluster_encs):
     """
     Вычисляет минимальное евклидово расстояние от query_enc до любого вектора в глобальном кластере.
     """

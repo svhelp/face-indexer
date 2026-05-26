@@ -1,6 +1,6 @@
 ﻿import argparse
 import json
-from core import extract_faces, cluster_local, save_previews, match_global, annotate_frames
+from core import extract_faces, cluster_local, save_previews, match_global, apply_global_matches, resolve_matches_cli, annotate_frames
 
 # ─────────────────────────────────────────────
 # ТОЧКА ВХОДА
@@ -32,12 +32,16 @@ if __name__ == "__main__":
     with open(local_path, "r", encoding="utf-8") as f:
         _local_data = json.load(f)
 
-    if "global_labels" not in _local_data:
-        # Шаг 2: Сопоставление с глобальными кластерами
-        match_global(frames_dir)
-
-        # Шаг 3: Отрисовка
-        annotate_frames(frames_dir)
-    else:
+    if "global_labels" in _local_data:
         print(f"\nГлобальные лейблы уже проставлены. Пропускаем шаги 2 и 3.")
-        print(f"Удалите '{local_path}' для повторной обработки.")
+        exit()
+        
+    # Шаг 2: Сопоставление с глобальными кластерами
+    result, local_data, global_clusters = match_global(frames_dir)
+
+    resolved_data = resolve_matches_cli(result, local_data, global_clusters)
+
+    apply_global_matches(frames_dir, resolved_data, local_data, global_clusters)
+
+    # Шаг 3: Отрисовка
+    annotate_frames(frames_dir, local_data, global_clusters)

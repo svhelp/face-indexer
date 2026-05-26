@@ -1,8 +1,10 @@
-﻿from utils import _min_distance_to_cluster, _find_medoid
+from utils import min_distance_to_cluster, find_medoid, get_color
 import cv2
 import os
 import json
 import numpy as np
+import shutil
+import uuid
 from pathlib import Path
 from sklearn.cluster import DBSCAN
 from insightface.app import FaceAnalysis
@@ -25,10 +27,10 @@ WEIGHT_RESOLUTION = 0.3     # Вес разрешения лица (размер
 WEIGHT_SHARPNESS = 0.1      # Вес четкости лица (резкость по Лапласиану)
 
 # Шаг 2: Сравнение с глобальными кластерами (два порога)
-# Сравнение идёт по минимальному расстоянию до любого вектора в глобальном кластере.
-GLOBAL_MATCH_STRICT = 0.70     # < этого: точное совпадение, вектор НЕ добавляем (уже представлен)
-GLOBAL_MATCH_ADD    = 1.05     # < этого: совпадение, но вектор ДОБАВЛЯЕМ (новый ракурс/освещение)
-                               # >= этого: новый человек
+GLOBAL_MATCH_STRICT = 1.00     # < этого: точное совпадение, вектор НЕ добавляем (уже представлен)
+GLOBAL_MATCH_ADD    = 1.15     # < этого: совпадение, но вектор ДОБАВЛЯЕМ (новый ракурс/освещение)
+GLOBAL_MATCH_AMBIGUOUS = 1.30  # < этого: сомнительное совпадение, запрашиваем человека
+                               # >= этого: точно новый человек, запрашиваем имя
 
 MAX_ENCODINGS_PER_CLUSTER = 25 # Максимум векторов на глобальный кластер (против разрастания JSON)
 
@@ -130,37 +132,7 @@ def extract_faces(video_path, interval_seconds=5.0):
         if face_list:
             filename = f"frame_{saved_count:04d}.jpg"
             output_path = os.path.join(output_dir, filename)
-            # === ВРЕМЕННАЯ ОТЛАДОЧНАЯ АННОТАЦИЯ (УДАЛИТЬ ПОСЛЕ ОТЛАДКИ) ===
-            debug_frame = frame.copy()
-            for face, face_meta in zip(faces, face_list):
-                x1, y1, x2, y2 = [int(v) for v in face.bbox]
-                h, w = debug_frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                
-                # Рисуем зеленую рамку вокруг лица
-                cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Получаем все характеристики InsightFace
-                info = []
-                if hasattr(face, "det_score") and face.det_score is not None:
-                    info.append(f"Score: {face.det_score:.2f}")
-                if hasattr(face, "gender") and face.gender is not None:
-                    gender_str = "M" if face.gender == 1 else "F"
-                    info.append(f"Sex: {gender_str}")
-                if hasattr(face, "age") and face.age is not None:
-                    info.append(f"Age: {int(face.age)}")
-                
-                # Добавляем рассчитанную нами дисперсию Лапласиана (резкость)
-                blur_val = face_meta.get("blur_value", 0.0)
-                info.append(f"Sharp: {blur_val:.1f}")
-                
-                text_str = ", ".join(info)
-                cv2.putText(debug_frame, text_str, (x1, max(y1 - 10, 20)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-            
-            cv2.imwrite(output_path, debug_frame)
-            # ==============================================================
+            cv2.imwrite(output_path, frame)
             
             results[filename] = face_list
             print(f"[{filename} (кадр {frame_idx})] Сохранено! Найдено лиц: {len(face_list)}")
@@ -224,7 +196,7 @@ def cluster_local(frames_dir):
         print("Не удалось получить признаки ни одного лица.")
         return None
 
-    clt = DBSCAN(eps=EPSILON_FACE_CLUSTERS, metric="euclidean", min_samples=2, n_jobs=-1)
+    clt = DBSCAN(eps=EPSILON_FACE_CLUSTERS, metric="euclidean", min_samples=4, n_jobs=-1)
     clt.fit(encodings)
     labels = clt.labels_.tolist()
 
@@ -240,7 +212,7 @@ def cluster_local(frames_dir):
             continue
         # Собираем все векторы этого кластера
         cluster_encs = [encodings[i] for i, l in enumerate(labels) if l == label]
-        medoids[str(label)] = _find_medoid(cluster_encs)
+        medoids[str(label)] = [find_medoid(cluster_encs)]
 
     # Группируем результаты по кадрам
     frames_dict = {}
@@ -268,6 +240,51 @@ def cluster_local(frames_dir):
     print(f"  Оптимизированные локальные кластеры сохранены в '{local_clusters_path}'.")
     return local_clusters_path
 
+def merge_local_clusters(frames_dir, label_from, label_to):
+    """
+    Объединяет два локальных кластера.
+    Переносит список медоидов из label_from в label_to.
+    Обновляет метки local_label у всех соответствующих кадров.
+    """
+    local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
+    if not os.path.exists(local_clusters_path):
+        print(f"Ошибка: '{local_clusters_path}' не найден.")
+        return
+
+    with open(local_clusters_path, "r", encoding="utf-8") as f:
+        local_data = json.load(f)
+
+    str_from = str(label_from)
+    str_to = str(label_to)
+
+    if str_from not in local_data.get("medoids", {}) or str_to not in local_data.get("medoids", {}):
+        print(f"Ошибка: Лейбл {label_from} или {label_to} не найден в медоидах.")
+        return
+
+    # 1. Объединяем медоиды
+    local_data["medoids"][str_to].extend(local_data["medoids"][str_from])
+    del local_data["medoids"][str_from]
+
+    # 1.5. Объединяем превью, если они есть
+    if "previews" in local_data:
+        if str_from in local_data["previews"]:
+            if str_to not in local_data["previews"]:
+                local_data["previews"][str_to] = []
+            local_data["previews"][str_to].extend(local_data["previews"][str_from])
+            del local_data["previews"][str_from]
+
+    # 2. Обновляем метки в кадрах
+    for filename, faces in local_data.get("frames", {}).items():
+        for face in faces:
+            if face.get("local_label") == label_from:
+                face["local_label"] = label_to
+
+    # 3. Сохраняем обновленный JSON
+    with open(local_clusters_path, "w", encoding="utf-8") as f:
+        json.dump(local_data, f, indent=4, ensure_ascii=False)
+
+    print(f"Группа {label_from} успешно объединена с группой {label_to}.")
+    return local_clusters_path
 
 # ─────────────────────────────────────────────
 # ШАГ 1.5: Сохранение превью групп
@@ -293,7 +310,10 @@ def save_previews(frames_dir):
     previews_dir = os.path.join(frames_dir, "previews")
     os.makedirs(previews_dir, exist_ok=True)
 
-    print(f"\n[Шаг 1.5] Сохранение превью групп (ТОП-3) в '{previews_dir}'...")
+    print(f"\n[Шаг 1.5] Сохранение превью групп (ТОП-4) в '{previews_dir}'...")
+
+    # Добавляем хранилище для путей к превью
+    local_data["previews"] = {}
 
     # Группируем детекции по локальным лейблам
     from collections import defaultdict
@@ -349,8 +369,8 @@ def save_previews(frames_dir):
         # Сортируем детекции по финальному скору по убыванию
         processed_dets.sort(key=lambda x: x["final_score"], reverse=True)
 
-        # Сохраняем топ-3
-        top_k = min(3, len(processed_dets))
+        # Сохраняем топ-4
+        top_k = min(4, len(processed_dets))
         print(f"  Группа {lbl}: найдено кадров {len(processed_dets)}, экспортируем ТОП-{top_k}:")
         
         for rank in range(top_k):
@@ -376,18 +396,30 @@ def save_previews(frames_dir):
                     cropped_path = os.path.join(previews_dir, f"group_{lbl}_rank{rank_num}_cropped.jpg")
                     cv2.imwrite(cropped_path, cropped_face)
                     
+                    if str(lbl) not in local_data["previews"]:
+                        local_data["previews"][str(lbl)] = []
+                    local_data["previews"][str(lbl)].append(cropped_path)
+                    
                 print(f"    [Rank {rank_num}] {best_det['filename']} (Скор: {best_det['final_score']:.3f}, Резкость: {best_det['blur_value']:.1f}, Score: {best_det['det_score']:.2f}, Разрешение: {best_det['width']}x{best_det['height']}px)")
+
+    # Сохраняем обновленный JSON с путями к превью
+    with open(local_clusters_path, "w", encoding="utf-8") as f:
+        json.dump(local_data, f, indent=4, ensure_ascii=False)
 
     print("  Шаг 1.5 завершен.")
 
 
 # ─────────────────────────────────────────────
-# ШАГ 2: Сравнение с глобальными кластерами
+# ШАГ 2: Сопоставление с глобальными кластерами
 # ─────────────────────────────────────────────
 
 def match_global(frames_dir):
     """
-    Шаг 2: Сопоставление локальных медоидов с глобальными кластерами.
+    Шаг 2 (драй-ран): Вычисляет дистанции до глобальных кластеров, ничего не пишет на диск.
+    Возвращает словарь с разбиением на три группы:
+      - auto:     [лист] {локальный лейбл, индекс глобального кластера, режим}
+      - ambiguous:[лист] {локальный лейбл, индекс кандидата, дистанция}
+      - new:      [лист] {локальный лейбл, дистанция}
     """
     local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
     if not os.path.exists(local_clusters_path):
@@ -396,7 +428,6 @@ def match_global(frames_dir):
     with open(local_clusters_path, "r", encoding="utf-8") as f:
         local_data = json.load(f)
 
-    # Загружаем/инициализируем глобальные кластеры
     global_clusters_path = os.path.join("temp", "clusters_data.json")
     if os.path.exists(global_clusters_path):
         with open(global_clusters_path, "r", encoding="utf-8") as f:
@@ -404,90 +435,236 @@ def match_global(frames_dir):
     else:
         global_clusters = []
 
-    print(f"\n[Шаг 2] Глобальное сопоставление (по медоидам)...")
+    print(f"\n[Шаг 2] Анализ расстояний до глобальных кластеров...")
 
-    medoids = local_data["medoids"] # local_label_str -> vector
-    local_to_global = {-1: -1}
+    medoids = local_data["medoids"]
+    result = {"auto": [], "ambiguous": [], "new": []}
 
-    for label_str, medoid_enc in medoids.items():
+    for label_str, medoid_encs in medoids.items():
         local_label = int(label_str)
-        
+
         best_match_idx = -1
         best_distance = float("inf")
 
-        for gi, gc in enumerate(global_clusters):
-            dist = _min_distance_to_cluster(medoid_enc, gc["encodings"])
-            if dist < best_distance:
-                best_distance = dist
-                best_match_idx = gi
+        for medoid_enc in medoid_encs:
+            for gi, gc in enumerate(global_clusters):
+                dist = min_distance_to_cluster(medoid_enc, gc["encodings"])
+                if dist < best_distance:
+                    best_distance = dist
+                    best_match_idx = gi
 
-        if best_distance < GLOBAL_MATCH_ADD:
+        if best_distance < GLOBAL_MATCH_STRICT:
+            # Точное совпадение — автоматически, вектор не добавляем
+            result["auto"].append({
+                "local_label": local_label,
+                "global_idx": best_match_idx,
+                "distance": best_distance,
+                "mode": "strict"
+            })
             gc = global_clusters[best_match_idx]
+            print(f"  [{local_label}] -> {gc['label']} (точное совпадение, d={best_distance:.3f})")
+
+        elif best_distance < GLOBAL_MATCH_ADD:
+            # Хорошее совпадение — автоматически, добавляем новый ракурс
+            result["auto"].append({
+                "local_label": local_label,
+                "global_idx": best_match_idx,
+                "distance": best_distance,
+                "mode": "add"
+            })
+            gc = global_clusters[best_match_idx]
+            print(f"  [{local_label}] -> {gc['label']} (новый ракурс, d={best_distance:.3f})")
+
+        elif best_distance < GLOBAL_MATCH_AMBIGUOUS:
+            # Сомнительное совпадение — нужно подтверждение человека
+            gc = global_clusters[best_match_idx]
+            result["ambiguous"].append({
+                "local_label": local_label,
+                "global_idx": best_match_idx,
+                "distance": best_distance
+            })
+            print(f"  [{local_label}] -> {gc['label']}? (сомнительно, d={best_distance:.3f}) — нужно подтверждение")
+
+        else:
+            # Точно новый человек
+            result["new"].append({
+                "local_label": local_label,
+                "distance": best_distance
+            })
+            print(f"  [{local_label}] -> новый человек (d={best_distance:.3f}) — нужно имя")
+
+    return result, local_data, global_clusters
+
+
+def apply_global_matches(frames_dir, match_result, local_data, global_clusters):
+    """
+    Шаг 2 (применение): Принимает финальные решения от пользователя, пишет всё на диск.
+    match_result — словарь с ключами auto/ambiguous/new,
+    где ambiguous и new уже дополнены полем resolved_global_idx или resolved_name.
+    """
+    local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
+    global_clusters_path = os.path.join("temp", "clusters_data.json")
+    global_previews_dir = os.path.join("temp", "global_previews")
+    os.makedirs(global_previews_dir, exist_ok=True)
+
+    medoids = local_data["medoids"]
+    local_to_global = {-1: -1}
+
+    def _copy_previews(local_label, gc):
+        """ Копирует превью локального кластера в глобальную папку. """
+        gc.setdefault("previews", [])
+        for src_path in local_data.get("previews", {}).get(str(local_label), []):
+            if os.path.exists(src_path):
+                ext = os.path.splitext(src_path)[1]
+                dst = os.path.join(global_previews_dir, f"{gc['label']}_{uuid.uuid4().hex[:8]}{ext}")
+                shutil.copy2(src_path, dst)
+                gc["previews"].append(dst)
+
+    # Автоматические совпадения
+    for m in match_result["auto"]:
+        local_label = m["local_label"]
+        gi = m["global_idx"]
+        gc = global_clusters[gi]
+        global_label_id = int(gc["label"].split("_")[1])
+        local_to_global[local_label] = global_label_id
+        _copy_previews(local_label, gc)
+
+        if m["mode"] == "add":
+            for enc in medoids[str(local_label)]:
+                if len(gc["encodings"]) < MAX_ENCODINGS_PER_CLUSTER:
+                    gc["encodings"].append(enc)
+
+    # Разрешённые сомнительные совпадения
+    for m in match_result["ambiguous"]:
+        local_label = m["local_label"]
+        if "resolved_global_idx" in m:
+            # Пользователь подтвердил совпадение
+            gi = m["resolved_global_idx"]
+            gc = global_clusters[gi]
             global_label_id = int(gc["label"].split("_")[1])
             local_to_global[local_label] = global_label_id
-
-            if best_distance < GLOBAL_MATCH_STRICT:
-                print(f"  {local_label} -> {gc['label']} (точное совпадение, d={best_distance:.3f})")
-            else:
-                # Добавляем медоид в глобальный список
+            for enc in medoids[str(local_label)]:
                 if len(gc["encodings"]) < MAX_ENCODINGS_PER_CLUSTER:
-                    gc["encodings"].append(medoid_enc)
-                    print(f"  {local_label} -> {gc['label']} (добавлен новый ракурс, d={best_distance:.3f})")
+                    gc["encodings"].append(enc)
         else:
-            # Новый человек
+            # Пользователь отказал — новый человек
             max_id = max((int(gc["label"].split("_")[1]) for gc in global_clusters), default=-1)
             new_id = max_id + 1
-            global_label_str = f"person_{new_id}"
+            gc = {
+                "label": f"person_{new_id}",
+                "name": m["resolved_name"],
+                "encodings": medoids[str(local_label)].copy(),
+                "previews": []
+            }
+            global_clusters.append(gc)
             local_to_global[local_label] = new_id
+        _copy_previews(local_label, gc)
 
-            global_clusters.append({
-                "label": global_label_str,
-                "name": global_label_str, # По умолчанию имя совпадает с лейблом
-                "encodings": [medoid_enc]
-            })
-            print(f"  {local_label} -> новый {global_label_str} (d={best_distance:.3f})")
+    # Новые люди с введенными именами
+    for m in match_result["new"]:
+        local_label = m["local_label"]
+        max_id = max((int(gc["label"].split("_")[1]) for gc in global_clusters), default=-1)
+        new_id = max_id + 1
+        gc = {
+            "label": f"person_{new_id}",
+            "name": m["resolved_name"],
+            "encodings": medoids[str(local_label)].copy(),
+            "previews": []
+        }
+        global_clusters.append(gc)
+        local_to_global[local_label] = new_id
+        _copy_previews(local_label, gc)
 
-    # Сохраняем обновлённые глобальные кластеры
+    # Записываем всё на диск
     with open(global_clusters_path, "w", encoding="utf-8") as f:
         json.dump(global_clusters, f, indent=4, ensure_ascii=False)
 
-    # Обновляем local_clusters.json (заполняем global_label во всех кавлях)
     for filename, faces in local_data["frames"].items():
         for face in faces:
             face["global_label"] = local_to_global.get(face["local_label"], -1)
-    
+
     with open(local_clusters_path, "w", encoding="utf-8") as f:
         json.dump(local_data, f, indent=4, ensure_ascii=False)
 
-    print(f"  Глобальное сопоставление завершено.")
+    print("  Глобальные кластеры обновлены.")
     return local_clusters_path
 
+
+def resolve_matches_cli(match_result, local_data, global_clusters):
+    """
+    Консольный интерфейс для разрешения ambiguous и новых групп.
+    Модифицирует match_result на месте, добавляя resolved_*.
+    """
+    # Разрешаем сомнительные совпадения
+    for m in match_result["ambiguous"]:
+        local_label = m["local_label"]
+        gi = m["global_idx"]
+        gc = global_clusters[gi]
+
+        local_previews = local_data.get("previews", {}).get(str(local_label), [])
+        global_previews = gc.get("previews", [])
+
+        print(f"\n{'='*60}")
+        print(f"  Сомнительное совпадение (d={m['distance']:.3f})")
+        print(f"  Локальная группа [{local_label}]:")
+        for p in local_previews:
+            print(f"    {p}")
+        print(f"  Глобальный кластер [{gc['label']} / {gc['name']}]:")
+        for p in global_previews[-3:]:
+            print(f"    {p}")
+        print(f"{'='*60}")
+
+        answer = input("  Это один человек? [y/n]: ").strip().lower()
+        if answer == "y":
+            m["resolved_global_idx"] = gi
+            print(f"  -> Объединено с {gc['name']}.")
+        else:
+            name = input("  -> Новый человек. Введите имя: ").strip()
+            m["resolved_name"] = name or f"person_unknown_{local_label}"
+            print(f"  -> Создан новый человек: {m['resolved_name']}.")
+
+    # Запрашиваем имена для точно новых людей
+    for m in match_result["new"]:
+        local_label = m["local_label"]
+        local_previews = local_data.get("previews", {}).get(str(local_label), [])
+
+        print(f"\n{'='*60}")
+        print(f"  Новый человек [{local_label}] (d={m['distance']:.3f}):")
+        for p in local_previews:
+            print(f"    {p}")
+        print(f"{'='*60}")
+
+        name = input("  Введите имя: ").strip()
+        m["resolved_name"] = name or f"person_unknown_{local_label}"
+        print(f"  -> Создан: {m['resolved_name']}.")
+
+    # Спрашиваем имена для автоматически сопоставленных
+    print(f"\n{'='*60}")
+    print("  Автоматические совпадения:")
+    for m in match_result["auto"]:
+        gc = global_clusters[m["global_idx"]]
+        current_name = gc["name"]
+        print(f"    [{m['local_label']}] -> {current_name} (d={m['distance']:.3f}, режим: {m['mode']})")
+
+    print("  Подтвердите оставшиеся имена (или оставьте пустым, чтобы сохранить текущее):")
+    for m in match_result["auto"]:
+        gc = global_clusters[m["global_idx"]]
+        current_name = gc["name"]
+        new_name = input(f"    [{m['local_label']}] Имя [{current_name}]: ").strip()
+        if new_name:
+            gc["name"] = new_name
+
+    return match_result
+    
 # ─────────────────────────────────────────────
 # ШАГ 3: Отрисовка аннотаций на кадрах
 # ─────────────────────────────────────────────
 
-def get_color(label):
-    if label == -1:
-        return (128, 128, 128)
-    import colorsys
-    hue = (label * 137.508) % 360 / 360.0
-    r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-    return (int(b * 255), int(g * 255), int(r * 255))
-
-
-def annotate_frames(frames_dir):
+def annotate_frames(frames_dir, local_data, global_clusters):
     """
     Шаг 3: Рисует рамки с именами на кадрах на основе данных из local_clusters.json.
     Результаты сохраняются в <frames_dir>/annotated/.
     """
-    local_clusters_path = os.path.join(frames_dir, "local_clusters.json")
-    if not os.path.exists(local_clusters_path):
-        print(f"Ошибка: '{local_clusters_path}' не найден. Сначала выполните cluster_local() и match_global().")
-        return
-
-    with open(local_clusters_path, "r", encoding="utf-8") as f:
-        local_data = json.load(f)
-
     frames_dict = local_data.get("frames", {})
 
     annotated_dir = os.path.join(frames_dir, "annotated")
@@ -506,9 +683,13 @@ def annotate_frames(frames_dir):
 
         for face in faces:
             top, right, bottom, left = face["location"]
-            label = face.get("global_label", face.get("local_label", -1))
-            color = get_color(label)
-            text = f"Person {label}" if label != -1 else "Noise"
+
+            if "global_label" in face:
+                text = global_clusters[face.get("global_label")].get("name")
+            else:
+                text = f"Person {face.get("local_label", -1)}"
+
+            color = get_color(face.get("local_label", -1))
 
             cv2.rectangle(image, (left, top), (right, bottom), color, 2)
             cv2.putText(image, text, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
